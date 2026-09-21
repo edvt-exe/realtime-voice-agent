@@ -1,10 +1,12 @@
 from __future__ import annotations
 import asyncio
+import time
 import structlog
 
 from src.config import settings
-from src.pipeline.interfaces import VADProvider, STTProvider, LLMProvider, TTSProvider, VADEvent
+from src.pipeline.interfaces import VADProvider, STTProvider, LLMProvider, TTSProvider
 from src.pipeline.sentence_splitter import IncrementalSentenceSplitter
+from src.pipeline.latency import LatencyMarks
 
 log = structlog.get_logger()
 
@@ -20,7 +22,9 @@ class VoiceAgentOrchestrator:
         self.conversation_history: list[dict[str, str]] = []
         self.audio_in_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=settings.queue_maxsize)
         self.audio_out_q: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=settings.queue_maxsize)
+
         self._current_gen_task: asyncio.Task | None = None
+        self.latency = LatencyMarks()
 
     async def run(self) -> None:
         async with asyncio.TaskGroup() as tg:
@@ -30,10 +34,14 @@ class VoiceAgentOrchestrator:
     async def push_audio_chunk(self, chunk: bytes) -> None:
         await self.audio_in_q.put(chunk)
 
+    # Voice activity detection
     async def _vad_loop(self) -> None:
         async for event in self.vad.stream(self.audio_in_q):
             if event.type == "speech_start":
                 await self._handle_barge_in()
+            elif event.type == "speech_end":
+                self.latency = LatencyMarks(speech_end_ts=time.monotonic())
+                log.info("vad_speech_end")
 
     async def _handle_barge_in(self) -> None:
         task = self._current_gen_task
@@ -47,20 +55,27 @@ class VoiceAgentOrchestrator:
             except asyncio.QueueEmpty:
                 break
 
+    # Speech to text
     async def _stt_loop(self) -> None:
         async for transcript in self.stt.stream(self.audio_in_q):
             if not transcript.is_final:
                 continue
+            self.latency.stt_final_ts = time.monotonic()
             log.info("stt_final", text=transcript.text)
             self._current_gen_task = asyncio.create_task(self._generate_response(transcript.text))
 
+    # LLM
     async def _generate_response(self, user_text: str) -> None:
         self.conversation_history.append({"role": "user", "content": user_text})
         splitter = IncrementalSentenceSplitter()
         assistant_text = ""
+        first_token = True
 
         try:
             async for token in self.llm.stream(self.conversation_history):
+                if first_token:
+                    self.latency.llm_first_token_ts = time.monotonic()
+                    first_token = False
                 assistant_text += token
                 for sentence in splitter.feed(token):
                     await self._synthesize_and_enqueue(sentence)
@@ -76,6 +91,12 @@ class VoiceAgentOrchestrator:
             log.info("generation_cancelled", partial_text=assistant_text)
             raise
 
+    # Text to speech
     async def _synthesize_and_enqueue(self, sentence: str) -> None:
+        first_chunk = True
         async for audio_chunk in self.tts.stream(sentence):
+            if first_chunk and self.latency.tts_first_byte_ts == 0.0:
+                self.latency.tts_first_byte_ts = time.monotonic()
+                log.info("latency_report", **self.latency.report())
+                first_chunk = False
             await self.audio_out_q.put(audio_chunk)
