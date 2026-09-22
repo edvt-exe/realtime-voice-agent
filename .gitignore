@@ -18,4 +18,4 @@ env/
 
 # Logs / artifacts
 *.log
-benchmarks/results/
+benchmarks/results/benchmarks/results/
